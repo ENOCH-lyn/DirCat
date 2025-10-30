@@ -7,32 +7,97 @@ from datetime import datetime
 from .config import DEFAULT_EXCLUDE_PATTERNS, LANGUAGE_MAP
 
 
-def _get_ignore_patterns(root_path):
-    """从 .dircatignore 文件加载忽略模式."""
+DEFAULT_ENCODING_CANDIDATES = [
+    'utf-8',
+    'utf-8-sig',
+    'gb18030',
+    'gbk',
+    'big5',
+    'shift_jis',
+    'latin-1'
+]
+
+
+def _detect_bom_encoding(file_path: Path):
+    """检测文件的 BOM 并返回首选编码,未检测到则返回 None。"""
+    try:
+        with open(file_path, 'rb') as f:
+            raw = f.read(4)
+    except IOError:
+        return None
+
+    if raw.startswith(b'\xff\xfe\x00\x00'):
+        return 'utf-32'
+    if raw.startswith(b'\x00\x00\xfe\xff'):
+        return 'utf-32'
+    if raw.startswith(b'\xff\xfe'):
+        return 'utf-16'
+    if raw.startswith(b'\xfe\xff'):
+        return 'utf-16'
+    if raw.startswith(b'\xef\xbb\xbf'):
+        return 'utf-8-sig'
+    return None
+
+
+def _prepare_encoding_sequence(file_path: Path, fallback_candidates=None):
+    """根据 BOM 优先级构建编码尝试顺序。"""
+    fallback_candidates = fallback_candidates or DEFAULT_ENCODING_CANDIDATES
+    sequence = []
+
+    bom_encoding = _detect_bom_encoding(file_path)
+    if bom_encoding:
+        sequence.append(bom_encoding)
+
+    for encoding in fallback_candidates:
+        if encoding not in sequence:
+            sequence.append(encoding)
+
+    return sequence
+
+
+def _get_ignore_patterns(root_path, encodings=None):
+    """从 .dircatignore 文件加载忽略模式,逐个尝试提供的编码."""
     ignore_file = Path(root_path) / '.dircatignore'
-    patterns = set()
-    if ignore_file.is_file():
-        with open(ignore_file, 'r', encoding='utf-8') as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith('#'):
-                    patterns.add(line)
-    return patterns
+    if not ignore_file.is_file():
+        return set()
+
+    encodings = encodings or DEFAULT_ENCODING_CANDIDATES
+
+    for encoding in _prepare_encoding_sequence(ignore_file, encodings):
+        try:
+            with open(ignore_file, 'r', encoding=encoding) as f:
+                patterns = set()
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#'):
+                        patterns.add(line)
+                return patterns
+        except UnicodeDecodeError:
+            continue
+        except IOError:
+            break
+
+    return set()
 
 
-def _read_file_content(file_path, base_path):
-    """读取并格式化单个文件的内容,在前面加上文件路径标题。"""
+def _read_file_content(file_path, base_path, encodings=None):
+    """读取并格式化单个文件的内容,在前面加上文件路径标题,支持多编码。"""
+    encodings = encodings or DEFAULT_ENCODING_CANDIDATES
     relative_path = file_path.relative_to(base_path)
     header = f"--- 文件: {relative_path.as_posix()} ---\n"
-    try:
-        with open(file_path, 'r', encoding='utf-8') as file:
-            content = file.read()
-            lang = LANGUAGE_MAP.get(file_path.suffix, '')
-            return f"{header}{lang}\n{content}\n\n"
-    except UnicodeDecodeError:
-        return f"{header}*** 无法以 UTF-8 格式读取二进制文件 ***\n\n"
-    except IOError as e:
-        return f"{header}*** 无法读取文件: {e} ***\n\n"
+    for encoding in _prepare_encoding_sequence(file_path, encodings):
+        try:
+            with open(file_path, 'r', encoding=encoding) as file:
+                content = file.read()
+                lang = LANGUAGE_MAP.get(file_path.suffix, '')
+                opening = f"```{lang}\n" if lang else "```\n"
+                return f"{header}{opening}{content}\n```\n\n"
+        except UnicodeDecodeError:
+            continue
+        except IOError as e:
+            return f"{header}*** 无法读取文件: {e} ***\n\n"
+
+    return f"{header}*** 无法使用以下编码读取文件: {', '.join(encodings)} ***\n\n"
 
 
 def _is_excluded(path, patterns, base_path):
@@ -51,16 +116,17 @@ def _is_excluded(path, patterns, base_path):
             
     return False
 
-def generate_tree_output(root_path, user_exclude, max_items):
+def generate_tree_output(root_path, user_exclude, max_items, encodings=None):
     """
     递归地获取目录结构和文件内容,首先显示树形结构,然后是文件内容。
     """
+    encodings = encodings or DEFAULT_ENCODING_CANDIDATES
     tree_lines = []
     content_lines = []
     base_path = Path(root_path)
     
     cli_patterns = set(user_exclude)
-    file_patterns = _get_ignore_patterns(base_path)
+    file_patterns = _get_ignore_patterns(base_path, encodings)
     all_exclude_patterns = DEFAULT_EXCLUDE_PATTERNS.union(cli_patterns).union(file_patterns).union({'.dircatignore'})
 
     files_to_read = []
@@ -90,7 +156,7 @@ def generate_tree_output(root_path, user_exclude, max_items):
     if files_to_read:
         content_lines.append("\n--- 文件内容 ---\n\n")
         for file_path in files_to_read:
-            content_lines.append(_read_file_content(file_path, base_path))
+            content_lines.append(_read_file_content(file_path, base_path, encodings))
 
     return "".join(tree_lines) + "".join(content_lines)
 
@@ -133,27 +199,48 @@ def main():
     args = parser.parse_args()
     target_path = Path(args.path).resolve()
 
+    encoding_candidates = DEFAULT_ENCODING_CANDIDATES
+
     if args.exclude:
         ignore_file_path = target_path / '.dircatignore'
         newly_added = []
         
         try:
-            existing_patterns = set(ignore_file_path.read_text(encoding='utf-8').splitlines()) if ignore_file_path.is_file() else set()
-            
-            with open(ignore_file_path, 'a', encoding='utf-8') as f:
-                for pattern in args.exclude:
-                    if pattern not in existing_patterns:
-                        f.write(f"\n{pattern}")
-                        newly_added.append(pattern)
-            
-            if newly_added:
-                print(f"✨ 已经将规则自动写入 .dircatignore 文件")
+            existing_patterns = set()
+            file_exists = ignore_file_path.is_file()
+            active_encoding = encoding_candidates[0]
+
+            if file_exists:
+                for encoding in _prepare_encoding_sequence(ignore_file_path, encoding_candidates):
+                    try:
+                        existing_content = ignore_file_path.read_text(encoding=encoding)
+                        existing_patterns = set(line.strip() for line in existing_content.splitlines() if line.strip())
+                        active_encoding = encoding
+                        break
+                    except UnicodeDecodeError:
+                        continue
+                # 如果全部解码失败,existing_patterns 保持为空,使用首选编码写入
+
+            patterns_to_add = []
+            for pattern in args.exclude:
+                pattern = pattern.strip()
+                if pattern and pattern not in existing_patterns:
+                    patterns_to_add.append(pattern)
+                    newly_added.append(pattern)
+
+            if patterns_to_add:
+                file_size = ignore_file_path.stat().st_size if file_exists else 0
+                with open(ignore_file_path, 'a', encoding=active_encoding) as f:
+                    if file_size > 0:
+                        f.write('\n')
+                    f.write('\n'.join(patterns_to_add))
+                print("✨ 已经将规则自动写入 .dircatignore 文件")
         except IOError as e:
             print(f"⚠️ 警告：无法写入 .dircatignore 文件: {e}")
 
     try:
         # 将临时忽略规则传递给生成函数
-        structure = generate_tree_output(target_path, args.ignore_temp, args.max_items)
+        structure = generate_tree_output(target_path, args.ignore_temp, args.max_items, encoding_candidates)
         
         if args.output:
             # 如果指定了输出文件

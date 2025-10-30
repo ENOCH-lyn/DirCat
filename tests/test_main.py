@@ -92,6 +92,35 @@ def test_language_detection(test_project):
     assert "--- 文件: file1.txt ---" in output
     assert "```\nhello\n```" in output
 
+
+def test_encoding_detection_multiple_files(tmp_path):
+    """测试不同编码类型的文件能被自动检测并正确读取。"""
+    project_root = tmp_path / "encoding_project"
+    project_root.mkdir()
+
+    gbk_file = project_root / "gbk.txt"
+    gbk_content = "你好，世界"
+    gbk_file.write_bytes(gbk_content.encode('gbk'))
+
+    utf16_file = project_root / "utf16.txt"
+    utf16_content = "Hello UTF16"
+    utf16_file.write_text(utf16_content, encoding='utf-16')
+
+    utf8_file = project_root / "utf8.txt"
+    utf8_content = "plain utf8"
+    utf8_file.write_text(utf8_content, encoding='utf-8')
+
+    output = generate_tree_output(str(project_root), user_exclude=[], max_items=20)
+
+    assert "📜 gbk.txt" in output
+    assert gbk_content in output
+
+    assert "📜 utf16.txt" in output
+    assert utf16_content in output
+
+    assert "📜 utf8.txt" in output
+    assert utf8_content in output
+
 @patch('src.DirCat.main.pyperclip')
 def test_output_to_clipboard(mock_pyperclip, test_project, capsys):
     """测试默认输出到剪切板。"""
@@ -158,3 +187,35 @@ def test_combined_options(test_project, tmp_path, capsys):
     
     # 4. 验证 -n 的效果也立即生效
     assert 'file3.log' not in output_content # 被永久忽略
+
+
+def test_dircatignore_append_preserves_encoding(tmp_path, capsys):
+    """测试对非 UTF-8 编码的 .dircatignore 追加规则时保持原有编码。"""
+    project_root = tmp_path / "encoding_project"
+    project_root.mkdir()
+
+    # 创建一个包含非 ASCII 内容的 gbk 编码 .dircatignore
+    ignore_path = project_root / '.dircatignore'
+    original_text = "初始模式\n"
+    ignore_path.write_bytes(original_text.encode('gbk'))
+
+    # 准备最小化的项目结构以便 main 正常运行
+    sample_file = project_root / 'sample.txt'
+    sample_file.write_text('content', encoding='utf-8')
+
+    output_path = tmp_path / 'encoding_output.txt'
+
+    with patch('sys.argv', ['dircat', str(project_root), '-n', '*.tmp', '-o', str(output_path)]):
+        main()
+
+    capsys.readouterr()  # 清理输出，避免影响后续断言
+
+    # 断言 .dircatignore 仍可用 gbk 正确解码并包含新规则
+    updated_bytes = ignore_path.read_bytes()
+    decoded_content = updated_bytes.decode('gbk')
+
+    assert '初始模式' in decoded_content
+    assert '*.tmp' in decoded_content
+
+    # 确保输出文件被创建，避免剪贴板路径
+    assert output_path.is_file()
