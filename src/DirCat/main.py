@@ -116,24 +116,28 @@ def _is_excluded(path, patterns, base_path):
             
     return False
 
-def generate_tree_output(root_path, user_exclude, max_items, encodings=None):
-    """
-    递归地获取目录结构和文件内容,首先显示树形结构,然后是文件内容。
+def generate_tree_output(root_path, user_exclude, max_items, encodings=None,
+                         style="emoji", include_content=True):
+    """生成目录结构(两种显示模式)和可选的文件内容。
+
+    :param style: "emoji" 使用 📂/📜 前缀; "ascii" 使用树形字符 (├─, └─)。
+    :param include_content: False 时仅输出目录结构,不附带文件内容。
     """
     encodings = encodings or DEFAULT_ENCODING_CANDIDATES
     tree_lines = []
     content_lines = []
     base_path = Path(root_path)
-    
+
     cli_patterns = set(user_exclude)
     file_patterns = _get_ignore_patterns(base_path, encodings)
     all_exclude_patterns = DEFAULT_EXCLUDE_PATTERNS.union(cli_patterns).union(file_patterns).union({'.dircatignore'})
 
     files_to_read = []
 
+    # 预扫描,保留每一层的目录/文件列表,方便绘制 ASCII 树
     for root, dirs, files in os.walk(base_path, topdown=True):
         current_path = Path(root)
-        
+
         dirs[:] = [d for d in dirs if not _is_excluded(current_path / d, all_exclude_patterns, base_path)]
         files[:] = [f for f in files if not _is_excluded(current_path / f, all_exclude_patterns, base_path)]
 
@@ -143,17 +147,34 @@ def generate_tree_output(root_path, user_exclude, max_items, encodings=None):
             dirs[:] = []
             continue
 
-        level = len(current_path.relative_to(base_path).parts)
-        indent = ' ' * 4 * level
-        if current_path != base_path:
-            tree_lines.append(f"{indent}📂 {current_path.name}/\n")
-        
-        sub_indent = ' ' * 4 * (level + 1)
-        for f_name in sorted(files):
-            tree_lines.append(f"{sub_indent}📜 {f_name}\n")
-            files_to_read.append(current_path / f_name)
+        level_parts = current_path.relative_to(base_path).parts
+        level = len(level_parts)
 
-    if files_to_read:
+        if style == "emoji":
+            indent = ' ' * 4 * level
+            if current_path != base_path:
+                tree_lines.append(f"{indent}📂 {current_path.name}/\n")
+
+            sub_indent = ' ' * 4 * (level + 1)
+            for f_name in sorted(files):
+                tree_lines.append(f"{sub_indent}📜 {f_name}\n")
+                files_to_read.append(current_path / f_name)
+        else:  # ascii 树形模式
+            # 根目录单独处理,只打印一次名字
+            if current_path == base_path and not tree_lines:
+                tree_lines.append(f"{current_path.name}/\n")
+
+            entries = [f"{d}/" for d in sorted(dirs)] + sorted(files)
+            for index, name in enumerate(entries):
+                is_last = (index == len(entries) - 1)
+                prefix = "└── " if is_last else "├── "
+                indent = "    " * level
+                tree_lines.append(f"{indent}{prefix}{name}\n")
+
+            for f_name in sorted(files):
+                files_to_read.append(current_path / f_name)
+
+    if include_content and files_to_read:
         content_lines.append("\n--- 文件内容 ---\n\n")
         for file_path in files_to_read:
             content_lines.append(_read_file_content(file_path, base_path, encodings))
@@ -188,6 +209,21 @@ def main():
         type=int,
         default=20,
         help="如果一个文件夹下的文件和子文件夹总数超过此数量，则跳过该文件夹。默认值为 20。"
+    )
+    parser.add_argument(
+        '--style',
+        choices=['emoji', 'tree'],
+        default='tree',
+        help=(
+            "目录显示样式: "
+            "emoji = 使用 📂/📜 前缀; "
+            "tree = 使用 ASCII 树形 (├──, └──)。默认: emoji。"
+        )
+    )
+    parser.add_argument(
+        '-t','--tree-only',
+        action='store_true',
+        help="只显示目录结构(类似 tree 命令), 不包含文件内容。"
     )
     parser.add_argument(
         '-o', '--output',
@@ -234,37 +270,44 @@ def main():
                     if file_size > 0:
                         f.write('\n')
                     f.write('\n'.join(patterns_to_add))
-                print("✨ 已经将规则自动写入 .dircatignore 文件")
+                print("已经将规则自动写入 .dircatignore 文件")
         except IOError as e:
-            print(f"⚠️ 警告：无法写入 .dircatignore 文件: {e}")
+            print(f"警告：无法写入 .dircatignore 文件: {e}")
 
     try:
         # 将临时忽略规则传递给生成函数
-        structure = generate_tree_output(target_path, args.ignore_temp, args.max_items, encoding_candidates)
+        structure = generate_tree_output(
+            target_path,
+            args.ignore_temp,
+            args.max_items,
+            encoding_candidates,
+            style=args.style,
+            include_content=not args.tree_only,
+        )
         
         if args.output:
             # 如果指定了输出文件
             with open(args.output, 'w', encoding='utf-8') as f:
                 f.write(structure)
-            print(f"✅ 目录结构和文件内容已成功保存到文件: {args.output}")
+            print(f"已成功保存到文件: {args.output}")
         else:
             # 否则，尝试复制到剪切板，如果失败则回退到文件
             try:
                 pyperclip.copy(structure)
-                print("✅ 目录结构和文件内容已成功复制到剪切板！")
+                print("已成功复制到剪切板！")
             except pyperclip.PyperclipException:
                 # 剪切板不可用，自动保存到文件
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 fallback_filename = f"dircat_{timestamp}.txt"
                 with open(fallback_filename, 'w', encoding='utf-8') as f:
                     f.write(structure)
-                print("📋 警告：未检测到剪切板环境。")
-                print(f"✅ 输出已自动保存到文件: {fallback_filename}")
+                print("警告：未检测到剪切板环境。")
+                print(f"输出已自动保存到文件: {fallback_filename}")
 
     except FileNotFoundError:
-        print(f"❌ 错误：找不到指定的路径 '{target_path}'")
+        print(f"错误：找不到指定的路径 '{target_path}'")
     except Exception as e:
-        print(f"❌ 发生未知错误: {e}")
+        print(f"发生未知错误: {e}")
 
 
 if __name__ == "__main__":

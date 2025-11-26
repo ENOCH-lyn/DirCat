@@ -33,8 +33,8 @@ def test_project(tmp_path):
     return project_root
 
 def test_basic_structure_and_tree(test_project):
-    """测试基本的目录遍历、树状结构和文件内容读取。"""
-    output = generate_tree_output(str(test_project), user_exclude=[], max_items=20)
+    """测试基本的目录遍历、emoji 树状结构和文件内容读取。"""
+    output = generate_tree_output(str(test_project), user_exclude=[], max_items=20, style="emoji")
     
     # 检查树状结构
     assert "📜 file1.txt" in output
@@ -155,6 +155,26 @@ def test_output_to_file_option(test_project, tmp_path, capsys):
     captured = capsys.readouterr()
     assert f"已成功保存到文件: {output_path}" in captured.out
     assert output_path.read_text(encoding='utf-8') != ""
+
+
+def test_tree_style_ascii_only_structure(test_project):
+    """测试 ASCII 树形显示模式以及 tree-only 只输出目录结构。"""
+    # 只输出目录结构
+    output = generate_tree_output(
+        str(test_project),
+        user_exclude=[],
+        max_items=20,
+        style="tree",
+        encodings=None,
+        include_content=False,
+    )
+
+    # 1) 使用 ASCII 树形前缀
+    assert "├── file1.txt" in output or "└── file1.txt" in output
+    assert "sub/" in output
+
+    # 2) 不应包含文件内容分隔符
+    assert "--- 文件内容 ---" not in output
 
 def test_combined_options(test_project, tmp_path, capsys):
     """测试组合使用多个选项 (-n, -i, -o)。"""
