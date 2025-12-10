@@ -85,6 +85,32 @@ def _read_file_content(file_path, base_path, encodings=None):
     encodings = encodings or DEFAULT_ENCODING_CANDIDATES
     relative_path = file_path.relative_to(base_path)
     header = f"--- 文件: {relative_path.as_posix()} ---\n"
+    
+    # 先检查是否为二进制文件（在尝试文本解码前）
+    try:
+        with open(file_path, 'rb') as f:
+            chunk = f.read(1024)
+            
+            # 检查是否有文本编码的 BOM，如果有则不是二进制
+            has_text_bom = (
+                chunk.startswith(b'\xff\xfe') or  # UTF-16 LE
+                chunk.startswith(b'\xfe\xff') or  # UTF-16 BE
+                chunk.startswith(b'\xff\xfe\x00\x00') or  # UTF-32 LE
+                chunk.startswith(b'\x00\x00\xfe\xff') or  # UTF-32 BE
+                chunk.startswith(b'\xef\xbb\xbf')  # UTF-8 BOM
+            )
+            
+            # 如果有文本 BOM，跳过二进制检查
+            if not has_text_bom:
+                # 检查是否包含空字节，这是二进制文件的明确标志
+                if b'\x00' in chunk:
+                    file_size = file_path.stat().st_size
+                    size_str = f"{file_size:,} bytes" if file_size < 1024 else f"{file_size / 1024:.2f} KB"
+                    return f"{header}*** 二进制文件 ({size_str}) ***\n\n"
+    except:
+        pass
+    
+    # 尝试用所有编码读取文本文件
     for encoding in _prepare_encoding_sequence(file_path, encodings):
         try:
             with open(file_path, 'r', encoding=encoding) as file:
@@ -96,7 +122,8 @@ def _read_file_content(file_path, base_path, encodings=None):
             continue
         except IOError as e:
             return f"{header}*** 无法读取文件: {e} ***\n\n"
-
+    
+    # 如果不是明显的二进制文件，返回编码失败提示
     return f"{header}*** 无法使用以下编码读取文件: {', '.join(encodings)} ***\n\n"
 
 
@@ -116,11 +143,60 @@ def _is_excluded(path, patterns, base_path):
             
     return False
 
+def _build_tree_recursive(current_path, base_path, all_exclude_patterns, max_items, 
+                          prefix="", is_last=True, files_to_read=None):
+    """递归构建 ASCII 树形结构，返回树形字符串列表。"""
+    if files_to_read is None:
+        files_to_read = []
+    
+    lines = []
+    
+    # 当前目录名
+    if current_path == base_path:
+        lines.append(f"{current_path.name}/\n")
+    
+    try:
+        entries = list(current_path.iterdir())
+    except PermissionError:
+        return lines, files_to_read
+    
+    # 过滤排除项
+    dirs = sorted([e for e in entries if e.is_dir() and not _is_excluded(e, all_exclude_patterns, base_path)])
+    files = sorted([e for e in entries if e.is_file() and not _is_excluded(e, all_exclude_patterns, base_path)])
+    
+    # 检查数量限制
+    if len(dirs) + len(files) > max_items:
+        rel_path = current_path.relative_to(base_path)
+        lines.append(f"{prefix}--- 文件夹 '{rel_path}' 因为包含超过 {max_items} 个项目而被跳过 ---\n")
+        return lines, files_to_read
+    
+    all_entries = dirs + files
+    
+    for i, entry in enumerate(all_entries):
+        is_last_entry = (i == len(all_entries) - 1)
+        connector = "└── " if is_last_entry else "├── "
+        
+        if entry.is_dir():
+            lines.append(f"{prefix}{connector}{entry.name}/\n")
+            # 递归子目录
+            extension = "    " if is_last_entry else "│   "
+            sub_lines, files_to_read = _build_tree_recursive(
+                entry, base_path, all_exclude_patterns, max_items,
+                prefix + extension, is_last_entry, files_to_read
+            )
+            lines.extend(sub_lines)
+        else:
+            lines.append(f"{prefix}{connector}{entry.name}\n")
+            files_to_read.append(entry)
+    
+    return lines, files_to_read
+
+
 def generate_tree_output(root_path, user_exclude, max_items, encodings=None,
                          style="emoji", include_content=True):
     """生成目录结构(两种显示模式)和可选的文件内容。
 
-    :param style: "emoji" 使用 📂/📜 前缀; "ascii" 使用树形字符 (├─, └─)。
+    :param style: "emoji" 使用 📂/📜 前缀; "tree" 使用树形字符 (├─, └─)。
     :param include_content: False 时仅输出目录结构,不附带文件内容。
     """
     encodings = encodings or DEFAULT_ENCODING_CANDIDATES
@@ -134,23 +210,21 @@ def generate_tree_output(root_path, user_exclude, max_items, encodings=None,
 
     files_to_read = []
 
-    # 预扫描,保留每一层的目录/文件列表,方便绘制 ASCII 树
-    for root, dirs, files in os.walk(base_path, topdown=True):
-        current_path = Path(root)
+    if style == "emoji":
+        # emoji 模式：使用 os.walk
+        for root, dirs, files in os.walk(base_path, topdown=True):
+            current_path = Path(root)
 
-        dirs[:] = [d for d in dirs if not _is_excluded(current_path / d, all_exclude_patterns, base_path)]
-        files[:] = [f for f in files if not _is_excluded(current_path / f, all_exclude_patterns, base_path)]
+            dirs[:] = [d for d in dirs if not _is_excluded(current_path / d, all_exclude_patterns, base_path)]
+            files[:] = [f for f in files if not _is_excluded(current_path / f, all_exclude_patterns, base_path)]
 
-        if len(dirs) + len(files) > max_items:
-            rel_path = current_path.relative_to(base_path)
-            tree_lines.append(f"--- 文件夹 '{rel_path}' 因为包含超过 {max_items} 个项目而被跳过 ---\n")
-            dirs[:] = []
-            continue
+            if len(dirs) + len(files) > max_items:
+                rel_path = current_path.relative_to(base_path)
+                tree_lines.append(f"--- 文件夹 '{rel_path}' 因为包含超过 {max_items} 个项目而被跳过 ---\n")
+                dirs[:] = []
+                continue
 
-        level_parts = current_path.relative_to(base_path).parts
-        level = len(level_parts)
-
-        if style == "emoji":
+            level = len(current_path.relative_to(base_path).parts)
             indent = ' ' * 4 * level
             if current_path != base_path:
                 tree_lines.append(f"{indent}📂 {current_path.name}/\n")
@@ -159,20 +233,11 @@ def generate_tree_output(root_path, user_exclude, max_items, encodings=None,
             for f_name in sorted(files):
                 tree_lines.append(f"{sub_indent}📜 {f_name}\n")
                 files_to_read.append(current_path / f_name)
-        else:  # ascii 树形模式
-            # 根目录单独处理,只打印一次名字
-            if current_path == base_path and not tree_lines:
-                tree_lines.append(f"{current_path.name}/\n")
-
-            entries = [f"{d}/" for d in sorted(dirs)] + sorted(files)
-            for index, name in enumerate(entries):
-                is_last = (index == len(entries) - 1)
-                prefix = "└── " if is_last else "├── "
-                indent = "    " * level
-                tree_lines.append(f"{indent}{prefix}{name}\n")
-
-            for f_name in sorted(files):
-                files_to_read.append(current_path / f_name)
+    else:
+        # tree 模式：使用递归函数
+        tree_lines, files_to_read = _build_tree_recursive(
+            base_path, base_path, all_exclude_patterns, max_items
+        )
 
     if include_content and files_to_read:
         content_lines.append("\n--- 文件内容 ---\n\n")

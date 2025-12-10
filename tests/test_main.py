@@ -176,6 +176,86 @@ def test_tree_style_ascii_only_structure(test_project):
     # 2) 不应包含文件内容分隔符
     assert "--- 文件内容 ---" not in output
 
+
+def test_tree_style_nested_structure(tmp_path):
+    """测试 tree 模式在复杂嵌套结构下的正确性，确保不会漏掉文件或产生重复。"""
+    # 创建类似用户报告的复杂嵌套结构
+    project = tmp_path / "lfi-tmp"
+    project.mkdir()
+    
+    www = project / "www"
+    www.mkdir()
+    pages = www / "pages"
+    pages.mkdir()
+    
+    # 根目录文件
+    (project / "Dockerfile").write_text("FROM php:7.4")
+    (project / "README.md").write_text("# Test")
+    (project / "docker-compose.yml").write_text("version: '3'")
+    (project / "entrypoint.sh").write_text("#!/bin/sh")
+    (project / "exp.py").write_text("import sys")
+    
+    # www 目录文件
+    (www / "Nu1L.png").write_text("PNG")
+    (www / "index.php").write_text("<?php")
+    (www / "style.css").write_text("body {}")
+    
+    # pages 子目录文件
+    (pages / "contact.php").write_text("<?php contact")
+    (pages / "docs.php").write_text("<?php docs")
+    (pages / "home.php").write_text("<?php home")
+    (pages / "info.php").write_text("<?php info")
+    
+    output = generate_tree_output(
+        str(project),
+        user_exclude=[],
+        max_items=20,
+        style="tree",
+        include_content=True,
+    )
+    
+    # 验证根目录所有文件都存在
+    assert "Dockerfile" in output
+    assert "README.md" in output
+    assert "docker-compose.yml" in output
+    assert "entrypoint.sh" in output
+    assert "exp.py" in output
+    
+    # 验证 www 目录及其文件
+    assert "www/" in output
+    assert "Nu1L.png" in output
+    assert "index.php" in output
+    assert "style.css" in output
+    
+    # 验证 pages 子目录及其所有文件
+    assert "pages/" in output
+    assert "contact.php" in output
+    assert "docs.php" in output
+    assert "home.php" in output
+    assert "info.php" in output
+    
+    # 验证文件内容部分存在
+    assert "--- 文件内容 ---" in output
+    assert "--- 文件: Dockerfile ---" in output
+    assert "--- 文件: www/pages/contact.php ---" in output
+    
+    # 验证树形结构的连接符正确（不会把文件当目录）
+    # exp.py 后面不应该再有子项连接线
+    lines = output.split('\n')
+    for i, line in enumerate(lines):
+        if 'exp.py' in line and not line.strip().startswith('---'):
+            # exp.py 这一行后面不应该出现缩进更深的 pages/ 等
+            if i + 1 < len(lines):
+                next_line = lines[i + 1]
+                # 如果下一行是 pages/，它应该和 exp.py 同级或更外层
+                if 'pages/' in next_line:
+                    # 计算缩进深度：exp.py 和 pages/ 应该在同一级
+                    assert next_line.startswith('│') or next_line.startswith('├') or next_line.startswith('└')
+    
+    # 统计文件内容块数量，应该等于所有文件数
+    content_blocks = output.count('--- 文件:')
+    assert content_blocks == 12  # 5个根目录 + 3个www + 4个pages
+
 def test_combined_options(test_project, tmp_path, capsys):
     """测试组合使用多个选项 (-n, -i, -o)。"""
     output_path = tmp_path / "combined_output.txt"
@@ -239,3 +319,40 @@ def test_dircatignore_append_preserves_encoding(tmp_path, capsys):
 
     # 确保输出文件被创建，避免剪贴板路径
     assert output_path.is_file()
+
+
+def test_binary_file_handling(tmp_path):
+    """测试二进制文件（如图片）能被正确识别并标记，不会中断后续文件的处理。"""
+    project = tmp_path / "binary_test"
+    project.mkdir()
+    
+    # 创建一个模拟的 PNG 图片（包含空字节）
+    png_file = project / "image.png"
+    png_data = b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01'
+    png_file.write_bytes(png_data)
+    
+    # 在图片后面创建文本文件
+    text_file1 = project / "before.txt"
+    text_file1.write_text("文件在图片前面")
+    
+    text_file2 = project / "after.txt"
+    text_file2.write_text("文件在图片后面")
+    
+    # 生成输出
+    output = generate_tree_output(str(project), user_exclude=[], max_items=20, style="tree", include_content=True)
+    
+    # 验证所有文件都在树形结构中
+    assert "image.png" in output
+    assert "before.txt" in output
+    assert "after.txt" in output
+    
+    # 验证二进制文件被正确标记
+    assert "*** 二进制文件" in output
+    
+    # 验证文本文件内容存在（关键：图片后面的文件没有被跳过）
+    assert "文件在图片前面" in output
+    assert "文件在图片后面" in output
+    
+    # 验证文件内容块数量正确
+    content_blocks = output.count('--- 文件:')
+    assert content_blocks == 3  # before.txt + image.png + after.txt
